@@ -1,15 +1,16 @@
-name: Build Cyrus Android 17+ APK
+name: Build and Release Cyrus Android 17+ APK
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [ "**" ]
+    tags: [ "v*" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -18,16 +19,24 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          java-version: "17"
+          distribution: "temurin"
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK (API 37 / Android 17)
         uses: android-actions/setup-android@v3
+
+      - name: Install Android 17 Platform (37.0) and symlink android-37
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "platform-tools" "platforms;android-37.0" "build-tools;35.0.0"
+          if [ -d "$ANDROID_HOME/platforms/android-37.0" ] && [ ! -e "$ANDROID_HOME/platforms/android-37" ]; then
+            ln -s "$ANDROID_HOME/platforms/android-37.0" "$ANDROID_HOME/platforms/android-37"
+          fi
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: "8.9"
 
       - name: Run Unit Tests
         run: gradle testDebugUnitTest
@@ -35,8 +44,21 @@ jobs:
       - name: Build Debug APK
         run: gradle assembleDebug
 
-      - name: Upload Cyrus Debug APK
+      - name: Prepare APK for Release
+        run: |
+          mkdir -p release_apks
+          cp app/build/outputs/apk/debug/*.apk release_apks/Cyrus-Android17-v1.0.${{ github.run_number }}.apk
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Cyrus-Android17-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: Cyrus-Android17-APK
+          path: release_apks/*.apk
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Cyrus Android 17+ v1.0.${{ github.run_number }}
+          generate_release_notes: true
+          files: release_apks/*.apk

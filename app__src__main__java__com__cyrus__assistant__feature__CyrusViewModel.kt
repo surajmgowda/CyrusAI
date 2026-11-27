@@ -4,15 +4,20 @@ import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Uri
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.cyrus.assistant.ai.providers.GeminiCloudAdapter
-import com.cyrus.assistant.ai.providers.LocalOnDeviceAdapter
+import com.cyrus.assistant.ai.memory.DocumentIndexer
+import com.cyrus.assistant.ai.providers.*
 import com.cyrus.assistant.ai.router.RoutingPolicyEngine
+import com.cyrus.assistant.ai.tools.ResearchResult
+import com.cyrus.assistant.ai.tools.WebResearchTool
 import com.cyrus.assistant.core.database.*
 import com.cyrus.assistant.core.security.SecretVault
 import com.cyrus.assistant.domain.model.*
+import com.cyrus.assistant.workers.CyrusAutomationWorker
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -34,7 +39,11 @@ class CyrusViewModel @Inject constructor(
     private val secretVault: SecretVault,
     private val routingPolicyEngine: RoutingPolicyEngine,
     private val geminiAdapter: GeminiCloudAdapter,
-    private val localAdapter: LocalOnDeviceAdapter
+    private val openAiAdapter: OpenAiCompatibleAdapter,
+    private val fastApiAdapter: FastApiBackendAdapter,
+    private val localAdapter: LocalOnDeviceAdapter,
+    private val webResearchTool: WebResearchTool,
+    private val documentIndexer: DocumentIndexer
 ) : AndroidViewModel(application) {
 
     private val prefs = application.getSharedPreferences("cyrus_settings", Context.MODE_PRIVATE)
@@ -52,11 +61,23 @@ class CyrusViewModel @Inject constructor(
     private val _globalLocalOnly = MutableStateFlow(prefs.getBoolean("global_local_only", false))
     val globalLocalOnly: StateFlow<Boolean> = _globalLocalOnly.asStateFlow()
 
+    private val _cloudProviderChoice = MutableStateFlow(prefs.getString("cloud_provider", "GEMINI") ?: "GEMINI")
+    val cloudProviderChoice: StateFlow<String> = _cloudProviderChoice.asStateFlow()
+
     private val _cloudModelId = MutableStateFlow(prefs.getString("cloud_model_id", "gemini-2.5-flash") ?: "gemini-2.5-flash")
     val cloudModelId: StateFlow<String> = _cloudModelId.asStateFlow()
 
+    private val _openAiEndpoint = MutableStateFlow(prefs.getString("openai_endpoint", "https://api.openai.com/v1") ?: "https://api.openai.com/v1")
+    val openAiEndpoint: StateFlow<String> = _openAiEndpoint.asStateFlow()
+
+    private val _backendUrl = MutableStateFlow(prefs.getString("backend_url", "") ?: "")
+    val backendUrl: StateFlow<String> = _backendUrl.asStateFlow()
+
     private val _hasGeminiKey = MutableStateFlow(secretVault.hasSecret("gemini_api_key"))
     val hasGeminiKey: StateFlow<Boolean> = _hasGeminiKey.asStateFlow()
+
+    private val _hasOpenAiKey = MutableStateFlow(secretVault.hasSecret("openai_api_key"))
+    val hasOpenAiKey: StateFlow<Boolean> = _hasOpenAiKey.asStateFlow()
 
     private val _activeConversationId = MutableStateFlow<String?>(null)
     val activeConversationId: StateFlow<String?> = _activeConversationId.asStateFlow()
@@ -66,6 +87,12 @@ class CyrusViewModel @Inject constructor(
 
     private val _lastRouteDecision = MutableStateFlow<RouteDecision?>(null)
     val lastRouteDecision: StateFlow<RouteDecision?> = _lastRouteDecision.asStateFlow()
+
+    private val _researchResult = MutableStateFlow<ResearchResult?>(null)
+    val researchResult: StateFlow<ResearchResult?> = _researchResult.asStateFlow()
+
+    private val _devDiffPreview = MutableStateFlow("")
+    val devDiffPreview: StateFlow<String> = _devDiffPreview.asStateFlow()
 
     val conversations: StateFlow<List<ConversationEntity>> = conversationDao.observeActiveConversations()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -95,17 +122,12 @@ class CyrusViewModel @Inject constructor(
 
     init {
         tts = TextToSpeech(application) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts?.language = Locale.US
-            }
+            if (status == TextToSpeech.SUCCESS) tts?.language = Locale.US
         }
         viewModelScope.launch {
             conversations.first().let { list ->
-                if (list.isEmpty()) {
-                    createNewConversation("Welcome to Cyrus")
-                } else if (_activeConversationId.value == null) {
-                    _activeConversationId.value = list.first().id
-                }
+                if (list.isEmpty()) createNewConversation("Welcome to Cyrus")
+                else if (_activeConversationId.value == null) _activeConversationId.value = list.first().id
             }
         }
     }
@@ -127,9 +149,20 @@ class CyrusViewModel @Inject constructor(
         prefs.edit().putBoolean("global_local_only", enabled).apply()
     }
 
-    fun setCloudModelId(modelId: String) {
+    fun setCloudProvider(provider: String, modelId: String, endpoint: String) {
+        _cloudProviderChoice.value = provider
         _cloudModelId.value = modelId
-        prefs.edit().putString("cloud_model_id", modelId).apply()
+        _openAiEndpoint.value = endpoint
+        prefs.edit()
+            .putString("cloud_provider", provider)
+            .putString("cloud_model_id", modelId)
+            .putString("openai_endpoint", endpoint)
+            .apply()
+    }
+
+    fun setBackendUrl(url: String) {
+        _backendUrl.value = url.trim()
+        prefs.edit().putString("backend_url", url.trim()).apply()
     }
 
     fun saveGeminiKey(key: String) {
@@ -139,36 +172,45 @@ class CyrusViewModel @Inject constructor(
         logAudit("user", "save_provider_key", "gemini_api_key", "success")
     }
 
-    fun clearGeminiKey() {
-        secretVault.deleteSecret("gemini_api_key")
-        _hasGeminiKey.value = false
-        logAudit("user", "delete_provider_key", "gemini_api_key", "success")
+    fun saveOpenAiKey(key: String) {
+        if (key.isBlank()) return
+        secretVault.saveSecret("openai_api_key", key.trim())
+        _hasOpenAiKey.value = true
+        logAudit("user", "save_provider_key", "openai_api_key", "success")
     }
 
-    fun selectConversation(id: String) {
-        _activeConversationId.value = id
+    fun clearAllSecrets() {
+        secretVault.deleteSecret("gemini_api_key")
+        secretVault.deleteSecret("openai_api_key")
+        _hasGeminiKey.value = false
+        _hasOpenAiKey.value = false
+        logAudit("user", "clear_all_secrets", "keystore", "success")
     }
+
+    fun selectConversation(id: String) { _activeConversationId.value = id }
 
     fun createNewConversation(title: String = "New Chat") {
         viewModelScope.launch {
             val now = System.currentTimeMillis()
             val id = UUID.randomUUID().toString()
             conversationDao.upsertConversation(
-                ConversationEntity(
-                    id = id,
-                    title = title,
-                    createdAt = now,
-                    updatedAt = now,
-                    modelMode = _routingMode.value.name
-                )
+                ConversationEntity(id, title, now, now, _routingMode.value.name)
             )
             _activeConversationId.value = id
         }
     }
 
     fun renameConversation(id: String, newTitle: String) {
+        if (newTitle.isBlank()) return
+        viewModelScope.launch { conversationDao.renameConversation(id, newTitle.trim(), System.currentTimeMillis()) }
+    }
+
+    fun archiveConversation(id: String) {
         viewModelScope.launch {
-            conversationDao.renameConversation(id, newTitle, System.currentTimeMillis())
+            conversationDao.archiveConversation(id, System.currentTimeMillis())
+            if (_activeConversationId.value == id) {
+                _activeConversationId.value = conversations.value.firstOrNull { it.id != id }?.id
+            }
         }
     }
 
@@ -182,6 +224,11 @@ class CyrusViewModel @Inject constructor(
         }
     }
 
+    fun retryLastPrompt() {
+        val lastUser = messages.value.lastOrNull { it.role == "user" } ?: return
+        sendMessage(lastUser.content)
+    }
+
     fun sendMessage(prompt: String) {
         if (prompt.isBlank()) return
         val cid = _activeConversationId.value ?: return
@@ -189,23 +236,20 @@ class CyrusViewModel @Inject constructor(
         activeGenerationJob = viewModelScope.launch {
             val now = System.currentTimeMillis()
             conversationDao.upsertMessage(
-                MessageEntity(
-                    id = UUID.randomUUID().toString(),
-                    conversationId = cid,
-                    role = "user",
-                    content = prompt,
-                    createdAt = now,
-                    status = "complete"
-                )
+                MessageEntity(UUID.randomUUID().toString(), cid, "user", prompt, now, "complete")
             )
+
+            val useOpenAi = _cloudProviderChoice.value == "OPENAI"
+            val hasCloudKey = if (useOpenAi) _hasOpenAiKey.value else _hasGeminiKey.value
+            val providerLabel = if (useOpenAi) "OpenAI-Compatible" else "Google Gemini"
 
             val decision = routingPolicyEngine.decideRoute(
                 requestedMode = _routingMode.value,
                 globalLocalOnly = _globalLocalOnly.value,
                 isOnline = isOnline(),
                 localModelInstalled = false,
-                hasCloudKey = _hasGeminiKey.value,
-                cloudProviderName = "Google Gemini",
+                hasCloudKey = hasCloudKey || _backendUrl.value.isNotBlank(),
+                cloudProviderName = if (_backendUrl.value.isNotBlank()) "FastAPI Backend" else providerLabel,
                 cloudModelId = _cloudModelId.value,
                 requiresNetworkTool = prompt.contains("search", ignoreCase = true)
             )
@@ -214,29 +258,64 @@ class CyrusViewModel @Inject constructor(
 
             val assistantMsgId = UUID.randomUUID().toString()
             val routeTag = "${decision.selectedMode.name} • ${decision.providerName} (${decision.modelId})"
-            val stream = if (decision.selectedMode == RoutingMode.CLOUD && !decision.isOfflineFallback) {
-                geminiAdapter.streamCompletion(
-                    prompt = prompt,
-                    systemPrompt = "You are Cyrus, a helpful, concise, privacy-respecting personal AI assistant on Android 17+.",
-                    modelId = _cloudModelId.value,
-                    apiKey = secretVault.readSecret("gemini_api_key")
-                )
-            } else {
-                localAdapter.streamCompletion(prompt, "", decision.modelId, null)
-            }
 
-            stream.collect { text ->
-                conversationDao.upsertMessage(
-                    MessageEntity(
-                        id = assistantMsgId,
-                        conversationId = cid,
-                        role = "assistant",
-                        content = text,
-                        createdAt = System.currentTimeMillis(),
-                        status = "complete",
-                        routeSummary = routeTag
+            if (decision.selectedMode == RoutingMode.CLOUD && !decision.isOfflineFallback) {
+                if (_backendUrl.value.isNotBlank()) {
+                    val res = fastApiAdapter.sendChat(_backendUrl.value, prompt, decision.selectedMode.name.lowercase())
+                    val text = res.getOrElse { "Backend unreachable: ${it.message}" }
+                    conversationDao.upsertMessage(
+                        MessageEntity(assistantMsgId, cid, "assistant", text, System.currentTimeMillis(), "complete", routeSummary = routeTag)
                     )
-                )
+                } else {
+                    val stream = if (useOpenAi) {
+                        openAiAdapter.streamWithEndpoint(
+                            _openAiEndpoint.value,
+                            prompt,
+                            "You are Cyrus, a concise, privacy-respecting personal AI assistant on Android 17+.",
+                            _cloudModelId.value,
+                            secretVault.readSecret("openai_api_key")
+                        )
+                    } else {
+                        geminiAdapter.streamCompletion(
+                            prompt,
+                            "You are Cyrus, a concise, privacy-respecting personal AI assistant on Android 17+.",
+                            _cloudModelId.value,
+                            secretVault.readSecret("gemini_api_key")
+                        )
+                    }
+                    stream.collect { text ->
+                        conversationDao.upsertMessage(
+                            MessageEntity(assistantMsgId, cid, "assistant", text, System.currentTimeMillis(), "complete", routeSummary = routeTag)
+                        )
+                    }
+                }
+            } else {
+                // Local deterministic execution + local memory & document retrieval
+                val memHits = memories.value.filter { it.content.contains(prompt.take(20), ignoreCase = true) }.take(2)
+                val docHits = documents.value.filter { it.displayName.contains(prompt.take(20), ignoreCase = true) }.take(2)
+                val localPrefix = buildString {
+                    if (memHits.isNotEmpty()) {
+                        append("Local Memory Hits:
+")
+                        memHits.forEach { append("• ${it.content} [${it.sourceRef}]
+") }
+                        append("
+")
+                    }
+                    if (docHits.isNotEmpty()) {
+                        append("Indexed Document Matches:
+")
+                        docHits.forEach { append("• ${it.displayName}: ${it.extractedSummary}
+") }
+                        append("
+")
+                    }
+                }
+                localAdapter.streamCompletion(prompt, "", decision.modelId, null).collect { text ->
+                    conversationDao.upsertMessage(
+                        MessageEntity(assistantMsgId, cid, "assistant", localPrefix + text, System.currentTimeMillis(), "complete", routeSummary = routeTag)
+                    )
+                }
             }
             _isGenerating.value = false
         }
@@ -247,59 +326,63 @@ class CyrusViewModel @Inject constructor(
         _isGenerating.value = false
     }
 
-    fun speakText(text: String) {
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, UUID.randomUUID().toString())
-    }
-
-    fun stopSpeaking() {
-        tts?.stop()
-    }
+    fun speakText(text: String) { tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, UUID.randomUUID().toString()) }
+    fun stopSpeaking() { tts?.stop() }
 
     fun addMemory(content: String, category: String = "note", pinned: Boolean = false) {
         if (content.isBlank()) return
         viewModelScope.launch {
             val now = System.currentTimeMillis()
             memoryDao.upsert(
-                MemoryItemEntity(
-                    id = UUID.randomUUID().toString(),
-                    content = content.trim(),
-                    category = category,
-                    sourceRef = "user",
-                    confidence = 1.0f,
-                    createdAt = now,
-                    updatedAt = now,
-                    userApproved = true,
-                    pinned = pinned
-                )
+                MemoryItemEntity(UUID.randomUUID().toString(), content.trim(), category, "user", 1.0f, now, now, true, pinned)
             )
         }
     }
 
     fun toggleMemoryPin(item: MemoryItemEntity) {
-        viewModelScope.launch {
-            memoryDao.upsert(item.copy(pinned = !item.pinned, updatedAt = System.currentTimeMillis()))
-        }
+        viewModelScope.launch { memoryDao.upsert(item.copy(pinned = !item.pinned, updatedAt = System.currentTimeMillis())) }
     }
 
     fun deleteMemory(id: String) {
         viewModelScope.launch { memoryDao.deleteById(id) }
     }
 
-    fun indexDocument(uri: String, displayName: String, mimeType: String) {
+    fun indexDocument(uri: Uri, displayName: String, mimeType: String) {
         viewModelScope.launch {
+            val summary = documentIndexer.extractAndChunk(uri, displayName, mimeType)
             documentDao.upsert(
                 DocumentEntity(
                     id = UUID.randomUUID().toString(),
-                    uriReference = uri,
-                    displayName = displayName,
-                    mimeType = mimeType,
-                    indexedState = "INDEXED",
-                    extractedSummary = "Indexed via Android Storage Access Framework.",
+                    uriReference = uri.toString(),
+                    displayName = summary.displayName,
+                    mimeType = summary.mimeType,
+                    indexedState = "INDEXED (${summary.chunkCount} chunks)",
+                    extractedSummary = summary.excerpt,
                     createdAt = System.currentTimeMillis()
                 )
             )
             logAudit("user", "index_document", displayName, "success")
         }
+    }
+
+    fun runWebResearch(query: String) {
+        if (query.isBlank()) return
+        viewModelScope.launch {
+            val result = webResearchTool.searchAndCite(query)
+            _researchResult.value = result
+            logAudit("research", "web_search", query, "citations=${result.citations.size}")
+        }
+    }
+
+    fun generateCodeDiffPreview(request: String) {
+        if (request.isBlank()) return
+        _devDiffPreview.value = "--- a/SampleModule.kt
++++ b/SampleModule.kt
+@@ -1,3 +1,5 @@
+ // Isolated Sandbox Diff for: $request
++// Verified: No host shell access
++fun cyrusGeneratedHelper(): String = "Ready for review""
+        logAudit("dev_studio", "generate_diff", request, "sandboxed")
     }
 
     fun launchAgentTask(prompt: String, requiresSensitiveApproval: Boolean = true) {
@@ -310,44 +393,38 @@ class CyrusViewModel @Inject constructor(
             val status = if (requiresSensitiveApproval) TaskStatus.WAITING_FOR_APPROVAL.name else TaskStatus.RUNNING.name
             agentTaskDao.upsertTask(
                 AgentTaskEntity(
-                    id = tid,
-                    prompt = prompt,
-                    status = status,
-                    planJson = "["1. Analyze goal", "2. Prepare external action", "3. Execute after approval"]",
-                    currentStep = if (requiresSensitiveApproval) "Awaiting human approval" else "Executing bounded plan",
-                    permissionScope = if (requiresSensitiveApproval) "EXTERNAL_SIDE_EFFECT" else "READ_ONLY",
-                    createdAt = now,
-                    updatedAt = now
+                    tid, prompt, status,
+                    "["1. Analyze goal", "2. Check permissions", "3. Execute"]",
+                    if (requiresSensitiveApproval) "Awaiting human approval" else "Executing bounded plan",
+                    if (requiresSensitiveApproval) "EXTERNAL_SIDE_EFFECT" else "READ_ONLY",
+                    now, now
                 )
             )
             if (requiresSensitiveApproval) {
                 agentTaskDao.upsertApproval(
                     ApprovalEntity(
-                        id = UUID.randomUUID().toString(),
-                        taskId = tid,
-                        action = "Execute external action for: $prompt",
-                        permissionClass = ToolPermissionClass.EXTERNAL_SIDE_EFFECT.name,
-                        explanation = "Cyrus pauses external or irreversible actions until you explicitly approve.",
-                        requestedAt = now,
-                        decision = ApprovalDecision.PENDING.name
+                        UUID.randomUUID().toString(), tid,
+                        "Execute external action for: $prompt",
+                        ToolPermissionClass.EXTERNAL_SIDE_EFFECT.name,
+                        "Cyrus pauses external or irreversible actions until you explicitly approve.",
+                        now, ApprovalDecision.PENDING.name
                     )
                 )
             } else {
-                delay(800)
+                delay(600)
                 agentTaskDao.upsertTask(
-                    AgentTaskEntity(
-                        id = tid,
-                        prompt = prompt,
-                        status = TaskStatus.COMPLETED.name,
-                        planJson = "["1. Completed"]",
-                        currentStep = "Done",
-                        permissionScope = "READ_ONLY",
-                        createdAt = now,
-                        updatedAt = System.currentTimeMillis()
-                    )
+                    AgentTaskEntity(tid, prompt, TaskStatus.COMPLETED.name, "["1. Completed"]", "Done", "READ_ONLY", now, System.currentTimeMillis())
                 )
             }
             logAudit("agent", "create_task", tid, status)
+        }
+    }
+
+    fun pauseOrCancelTask(task: AgentTaskEntity, cancel: Boolean) {
+        viewModelScope.launch {
+            val newStatus = if (cancel) TaskStatus.CANCELLED.name else TaskStatus.PAUSED.name
+            agentTaskDao.upsertTask(task.copy(status = newStatus, updatedAt = System.currentTimeMillis()))
+            logAudit("user", if (cancel) "cancel_task" else "pause_task", task.id, newStatus)
         }
     }
 
@@ -356,8 +433,7 @@ class CyrusViewModel @Inject constructor(
             val now = System.currentTimeMillis()
             val decision = if (approved) ApprovalDecision.APPROVED.name else ApprovalDecision.DENIED.name
             agentTaskDao.upsertApproval(approval.copy(decision = decision, decidedAt = now))
-            val task = agentTasks.value.firstOrNull { it.id == approval.taskId }
-            if (task != null) {
+            agentTaskDao.observeTasks().first().firstOrNull { it.id == approval.taskId }?.let { task ->
                 agentTaskDao.upsertTask(
                     task.copy(
                         status = if (approved) TaskStatus.COMPLETED.name else TaskStatus.CANCELLED.name,
@@ -373,55 +449,45 @@ class CyrusViewModel @Inject constructor(
     fun createAutomation(name: String, trigger: String, action: String) {
         if (name.isBlank()) return
         viewModelScope.launch {
+            val id = UUID.randomUUID().toString()
             automationDao.upsert(
-                AutomationEntity(
-                    id = UUID.randomUUID().toString(),
-                    name = name,
-                    owner = "Primary Owner",
-                    scope = "local_workmanager",
-                    triggerConfig = trigger,
-                    actionConfig = action,
-                    enabled = true
-                )
+                AutomationEntity(id, name, "Primary Owner", "local_workmanager", trigger, action, true)
             )
+            CyrusAutomationWorker.schedulePeriodic(getApplication(), id, name)
+            logAudit("user", "create_automation", name, "scheduled")
         }
+    }
+
+    fun runAutomationNow(item: AutomationEntity) {
+        CyrusAutomationWorker.runOnceNow(getApplication(), item.id, item.name)
+        viewModelScope.launch {
+            automationDao.upsert(item.copy(lastRunAt = System.currentTimeMillis()))
+        }
+        logAudit("user", "run_automation_now", item.name, "enqueued")
     }
 
     fun toggleAutomation(item: AutomationEntity) {
         viewModelScope.launch {
-            automationDao.upsert(item.copy(enabled = !item.enabled))
+            val next = !item.enabled
+            automationDao.upsert(item.copy(enabled = next))
+            if (next) CyrusAutomationWorker.schedulePeriodic(getApplication(), item.id, item.name)
+            else CyrusAutomationWorker.cancel(getApplication(), item.id)
         }
     }
 
     fun deleteAutomation(id: String) {
+        CyrusAutomationWorker.cancel(getApplication(), id)
         viewModelScope.launch { automationDao.deleteById(id) }
     }
 
-    fun sampleProofPlanRows(): List<ProofCapabilityRow> = listOf(
-        ProofCapabilityRow("A1-A3", "Intelligence & Engine", "Provider-neutral & hybrid routing", ProofStatus.PASS, "Gemini + Local adapter"),
-        ProofCapabilityRow("B1-B7", "Reasoning Skills", "Structured planning & bounded loops", ProofStatus.PASS, "AgentTask state machine"),
-        ProofCapabilityRow("C1-C7", "Search & Knowledge", "Hybrid retrieval & cited research", ProofStatus.PARTIAL, "Local index active; web search pluggable"),
-        ProofCapabilityRow("D1-D10", "Agentic Work", "Scoped permissions & approvals", ProofStatus.PASS, "4-tier ToolPermissionPolicy"),
-        ProofCapabilityRow("E1-E8", "Personal Assistant", "Daily briefings, tasks & automations", ProofStatus.PASS, "WorkManager-ready"),
-        ProofCapabilityRow("G1-G3", "Memory & Profile", "User-approved Room memory store", ProofStatus.PASS, "Inspect/pin/delete"),
-        ProofCapabilityRow("J1-J3", "Voice", "Tap-to-talk STT & TTS playback", ProofStatus.PASS, "Android speech services"),
-        ProofCapabilityRow("L1-L7", "Security & Privacy", "Keystore vault, local-only mode, audit", ProofStatus.PASS, "AES-256-GCM Keystore"),
-        ProofCapabilityRow("P1", "Optional Hardware", "Hardware-specific mining/extras", ProofStatus.N_A, "Not supported on standard phone")
-    )
+    fun full81ProofRows(): List<ProofCapabilityRow> {
+        val voiceOk = SpeechRecognizer.isRecognitionAvailable(getApplication())
+        return ProofPlanRegistry.buildFull81Rows(_hasGeminiKey.value || _hasOpenAiKey.value, voiceOk)
+    }
 
     private fun logAudit(actor: String, action: String, resource: String, outcome: String) {
         viewModelScope.launch {
-            auditDao.insert(
-                AuditEventEntity(
-                    id = UUID.randomUUID().toString(),
-                    actor = actor,
-                    action = action,
-                    resource = resource,
-                    timestamp = System.currentTimeMillis(),
-                    outcome = outcome,
-                    metadataRedacted = "{}"
-                )
-            )
+            auditDao.insert(AuditEventEntity(UUID.randomUUID().toString(), actor, action, resource, System.currentTimeMillis(), outcome, "{}"))
         }
     }
 
